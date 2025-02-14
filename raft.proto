@@ -37,3 +37,11 @@ message LogEntry {
     int32 term = 1;
     string command = 2;
 }
+// Raft 服务
+service Raft {
+    // AppendEntries 处理日志复制
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    
+    // RequestVote 处理领导者选举
+    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  }
