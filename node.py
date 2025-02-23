@@ -71,13 +71,14 @@ class Node(raft_pb2_grpc.RaftServicer):
         else:
             raise await ValueError("Invalid role")
 
-    async def requestVote(self, request, context):
-        response = raft_pb2.RequestVoteResponse()
+    async def RequestVote(self, request, context):
         logging.info(f"Node {self.id} received vote request {request}")
+        response = raft_pb2.RequestVoteResponse()
+   
 
         if request.term < self.currentTerm:
             response.voteGranted = False
-            return await response
+            return  response
 
         if request.term > self.currentTerm:
             self.currentTerm = request.term
@@ -88,12 +89,12 @@ class Node(raft_pb2_grpc.RaftServicer):
             response.voteGranted = True
         else:
             response.voteGranted = False
-        return await response
+        return  response
 
     async def leaderElection(self):
         logging.info(f"Node {self.id} starts election")
 
-        time.sleep(random.randint(1, 15))
+        time.sleep(random.randint(5, 15))
         logging.info(f"Node {self.id} starts election end")
         self.currentTerm += 1
         self.votedFor = None
@@ -110,26 +111,26 @@ class Node(raft_pb2_grpc.RaftServicer):
                 request.lastLogTerm = 0
             logging.info(f"Node {self.id} create vote request {request}")
 
-            response = await peer.requestVote(request)
+            response = await peer.RequestVote(request)
             logging.info(f"Node {self.id} received vote response {response}")
             if response.voteGranted:
                 self.votedReceived += 1
-                if self.votedReceived > len(self.peers) / 2:
-                    self.leaderTimer = DelayedTrigger(3, self.heartbeat)
-                    logging.info(f"Node {self.id} becomes leader")
-                    await self.set_role(Role.LEADER)
-                    return
+            if self.votedReceived > len(self.peers) / 2:
+                self.leaderTimer = DelayedTrigger(3, self.heartbeat)
+                logging.info(f"Node {self.id} becomes leader")
+                await self.set_role(Role.LEADER)
+                return
                 
     async def heartbeat(self):
+        logging.info(f"Node {self.id} sends heartbeat")
         for peer in self.peers:
             request = AppendEntriesRequest()
-            response = AppendEntriesResponse()
-            response = peer.appendEntries(request)
+            response = await peer.AppendEntries(request)
         self.leaderTimer.start()
 
-    def handleHeartbeat(self):
+    async def handleHeartbeat(self):
         tmp =self.followerTimer
-        self.followerTimer = DelayedTrigger(5, self.handleHeartbeatTimeout)
+        self.followerTimer = DelayedTrigger(10, self.handleHeartbeatTimeout)
         self.followerTimer.start()
         if tmp:
             tmp.cancel()
@@ -139,11 +140,12 @@ class Node(raft_pb2_grpc.RaftServicer):
         await self.set_role(Role.CANDIDATE)
         
 
-    async def appendEntries(self, request, context):
+    async def AppendEntries(self, request, context):
+        logging.info(f"Node {self.id} received append entries {request}")
         response = AppendEntriesResponse()
         if request.term < self.currentTerm:
             response.success = False
-            return await response
+            return  response
 
         self.currentTerm = request.term
         self.votedFor = None
@@ -151,11 +153,11 @@ class Node(raft_pb2_grpc.RaftServicer):
             response.success = True
             logging.info(f"Node {self.id} becomes follower")
             await self.set_role(Role.FOLLOWER)
-            return await response
+            return  response
 
         if len(self.log) < request.prevLogIndex or self.log[request.prevLogIndex].term != request.prevLogTerm:
             response.success = False
-            return await response
+            return  response
 
         self.log = self.log[:request.prevLogIndex + 1]
         self.log.extend(request.entries)
@@ -164,7 +166,7 @@ class Node(raft_pb2_grpc.RaftServicer):
             self.commitIndex = min(request.leaderCommit, len(self.log) - 1)
 
         response.success = True
-        return await response
+        return  response
 
 
     def write(self, data):
@@ -183,7 +185,7 @@ class Node(raft_pb2_grpc.RaftServicer):
             request.leaderCommit = self.commitIndex
             request.leaderId = self.id
             response = AppendEntriesResponse()
-            response = peer.appendEntries(request)
+            response = peer.AppendEntries(request)
             if response.success:
                 appendCnt += 1
         if appendCnt > len(self.peers) / 2:
@@ -192,6 +194,29 @@ class Node(raft_pb2_grpc.RaftServicer):
         else:
             return False
         return True
+    
+async def channel_ready(channel):
+    try:
+        await channel.channel_ready()
+    except grpc.RpcError as e:
+        logging.error(f"Channel not ready: {e}")
+from tenacity import (
+    retry,
+    wait_exponential,
+    stop_after_attempt,
+    retry_if_exception_type,
+    before_sleep_log
+)
+
+logger = logging.getLogger(__name__)
+
+@retry(
+    wait=wait_exponential(multiplier=1, max=2),  # 指数退避，最大间隔10秒
+    stop=stop_after_attempt(5),                   # 最多重试5次
+    retry=retry_if_exception_type(grpc.RpcError), # 仅重试 gRPC 错误
+    before_sleep=before_sleep_log(logger, logging.WARNING)  # 重试前打印日志
+)
+
 async def serve():
     parser = argparse.ArgumentParser(description="Raft Node")
     parser.add_argument("--id", type=int, help="Node ID", required=True)
@@ -201,19 +226,20 @@ async def serve():
     node = Node()
     node.id = parser.parse_args().id
     print("Node started {}".format(parser.parse_args().id))
+    server = grpc.aio.server()
+    raft_pb2_grpc.add_RaftServicer_to_server(node, server)
+    server.add_insecure_port("localhost:"+(str(parser.parse_args().port)))
+    logging.info("gRPC Server running on port {}...".format(parser.parse_args().port))
+    await server.start()
     print("Node started {}".format(parser.parse_args().peers))
     print("Node started {}".format(parser.parse_args().port))
     for peer in parser.parse_args().peers:
         peer = grpc.aio.insecure_channel(peer)
+        await channel_ready(peer)
         stub = raft_pb2_grpc.RaftStub(peer)
         node.peers.append(stub)
-        logging.info(f"Node {node.id} connected to peer {peer}")
+        logging.info(f"Node {node.id} connected to peer {peer} and stub is {stub}")
 
-    server = grpc.aio.server()
-    raft_pb2_grpc.add_RaftServicer_to_server(node, server)
-    server.add_insecure_port("localhost:"+(str(parser.parse_args().port)))
-    await server.start()
-    logging.info("gRPC Server running on port {}...".format(parser.parse_args().port))
     await server.wait_for_termination()
 
 if __name__ == "__main__":
