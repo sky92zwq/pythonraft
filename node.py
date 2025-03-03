@@ -72,7 +72,8 @@ class Node(raft_pb2_grpc.RaftServicer):
             raise await ValueError("Invalid role")
 
     async def RequestVote(self, request, context):
-        logging.info(f"Node {self.id} received vote request {request}")
+        logging.info(f"Node {self.id} received vote request term:{request.term} candidate:{request.candidateId} "
+                      f"lastLogIndex:{request.lastLogIndex} lastLogTerm:{request.lastLogTerm}")
         response = raft_pb2.RequestVoteResponse()
    
 
@@ -123,9 +124,17 @@ class Node(raft_pb2_grpc.RaftServicer):
                 
     async def heartbeat(self):
         logging.info(f"Node {self.id} sends heartbeat")
+        request = AppendEntriesRequest()
+        request.term = self.currentTerm
+        request.leaderId = self.id
+        if len(self.log) > 0:
+            request.prevLogIndex = len(self.log) -1
+            request.prevLogTerm = self.log[-1].term
+        request.leaderCommit = self.commitIndex
+        logging.info(f"Node {self.id} sends heartbeat is {request}")
         for peer in self.peers:
-            request = AppendEntriesRequest()
             response = await peer.AppendEntries(request)
+            logging.info(f"Node {self.id} sends heartbeat got {response}")
         self.leaderTimer.start()
 
     async def handleHeartbeat(self):
@@ -141,19 +150,29 @@ class Node(raft_pb2_grpc.RaftServicer):
         
 
     async def AppendEntries(self, request, context):
-        logging.info(f"Node {self.id} received append entries {request}")
+        logging.info(f"Node {self.id} received append entries term:{request.term} leaderId:{request.leaderId} "
+                        f"prevLogIndex:{request.prevLogIndex} prevLogTerm:{request.prevLogTerm} entries:{request.entries} leaderCommit:{request.leaderCommit}")
         response = AppendEntriesResponse()
         if request.term < self.currentTerm:
             response.success = False
             return  response
 
+        if len(request.entries) == 0 and request.leaderId != self.id:
+            logging.info(f"Node {self.id} may got heartbeat, self term is {self.currentTerm}")
+            if request.term>= self.currentTerm:
+                response.success = True
+                self.currentTerm = request.term
+                logging.info(f"Node {self.id} becomes follower, self term is {self.currentTerm}")
+                await self.set_role(Role.FOLLOWER)
+                return  response
+            else:
+                response.success = False
+                logging.info(f"Node {self.id} coming term is {request.term} less than {self.currentTerm}")
+                response.term = self.currentTerm
+                return response
+
         self.currentTerm = request.term
         self.votedFor = None
-        if request.entries is None and request.leaderId != self.id:
-            response.success = True
-            logging.info(f"Node {self.id} becomes follower")
-            await self.set_role(Role.FOLLOWER)
-            return  response
 
         if len(self.log) < request.prevLogIndex or self.log[request.prevLogIndex].term != request.prevLogTerm:
             response.success = False
@@ -243,5 +262,5 @@ async def serve():
     await server.wait_for_termination()
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(format='%(asctime)s - %(levelname)s: %(message)s', level=logging.DEBUG)
     asyncio.run(serve())
