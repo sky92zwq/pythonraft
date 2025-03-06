@@ -145,8 +145,11 @@ class Node(raft_pb2_grpc.RaftServicer):
         request.leaderCommit = self.commitIndex
         logger.info(f"Node {self.id} sends heartbeat is {request}")
         for peer in self.peers:
-            response = await peer.AppendEntries(request, wait_for_ready = False)
-            logger.info(f"Node {self.id} sends heartbeat got {response}")
+            try:
+                response = await peer.AppendEntries(request, wait_for_ready = False)
+                logger.info(f"Node {self.id} sends heartbeat got {response}")
+            except grpc.aio.AioRpcError as rpc_error:
+                logger.error(f"Node {self.id} sends heartbeat got exception {rpc_error}")
         self.leaderTimer.start()
 
     async def handleHeartbeat(self):
@@ -241,7 +244,6 @@ class Node(raft_pb2_grpc.RaftServicer):
 
         for peer in info.peers:
             peer = grpc.aio.insecure_channel(peer)
-            await channel_ready(peer)
             self.channels.append(peer)
             stub = raft_pb2_grpc.RaftStub(peer)
             self.peers.append(stub)
@@ -254,11 +256,6 @@ class Node(raft_pb2_grpc.RaftServicer):
         config = uvicorn.Config(self.app, host="0.0.0.0", port=info.port+3000, loop="asyncio")
         server = uvicorn.Server(config)
         await server.serve()
-async def channel_ready(channel):
-    try:
-        await channel.channel_ready()
-    except grpc.RpcError as e:
-        logger.error(f"Channel not ready: {e}")
 
 
 logger = logging.getLogger(__name__)
